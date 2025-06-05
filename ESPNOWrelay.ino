@@ -6,7 +6,9 @@
 #include "esp_wifi.h"
 #include <SimplePgSQL.h>
 #include "esp_sntp.h"
-
+#include <LittleFS.h>
+#include <Preferences.h>
+Preferences prefs;
 const char* bedroomauth = "8_-CN2rm4ki9P3i_NkPhxIbCiKd5RXhK";  //hubert
 
 uint8_t MAC_KAREN[] = {0x64, 0xE8, 0x33, 0x88, 0x66, 0xD0}; // confirmed
@@ -14,7 +16,12 @@ uint8_t MAC_LEON[]  = {0x84, 0xFC, 0xE6, 0x86, 0x5B, 0xB8}; // confirmed
 
 
 #define maximumReadings 360
+
+int readingCnt = 0;
 #define IDLE_TIMEOUT 10000  // 10 seconds
+#define MAX_BUFFERED_FILES 500
+#define MAX_RAM_BUFFERS 10
+
 IPAddress PGIP(192,168,50,197); 
  struct tm timeinfo;
 const char* ssid = "mikesnet";
@@ -26,11 +33,32 @@ const char dbname[] = "blynk_reporting";         // your database name
 
 bool buttonstart = false; // Button state to start transmission
 int currentSensorID = 0;  // 24 for Karen, 42 for Leon
+bool havedata = false;
 
+WidgetTerminal terminal(V122);
 
 #define every(interval) \
     static uint32_t __every__##interval = millis(); \
     if (millis() - __every__##interval >= interval && (__every__##interval = millis()))
+
+BLYNK_WRITE(V122) {
+  if (String("help") == param.asStr()) {
+    terminal.println("==List of available commands:==");
+    terminal.println("wifi");
+    terminal.println("==End of list.==");
+  }
+  if (String("wifi") == param.asStr()) {
+    terminal.print("Connected to: ");
+    terminal.println(ssid);
+    terminal.print("IP address:");
+    terminal.println(WiFi.localIP());
+    terminal.print("Signal strength: ");
+    terminal.println(WiFi.RSSI());
+    printLocalTime();
+  }
+    terminal.flush();
+}
+
 
 typedef struct {
   float temp1;
@@ -44,7 +72,7 @@ BLYNK_CONNECTED() {
   Blynk.syncVirtual(V121); //flash button
 }
 
-BLYNK_WRITE(V120)
+BLYNK_WRITE(V121)
 {
   if (param.asInt() == 1) {buttonstart = true;}
   if (param.asInt() == 0) {buttonstart = false;}
@@ -67,12 +95,12 @@ void initTime(String timezone){
 }
 
 sensorReadings Readings[maximumReadings];
-int readingCnt = 0;
+
 int arrayCnt = 0;
 
 bool readyToSend = false;
 unsigned long lastReceiveTime = 0;
-
+bool needLoadFromFlash = false;
 int i = 0;
 
 
@@ -286,6 +314,14 @@ void disableWiFi() {
   WiFi.mode(WIFI_OFF);
 }
 
+void printLocalTime() {
+  time_t rawtime;
+  struct tm* timeinfo;
+  time(&rawtime);
+  timeinfo = localtime(&rawtime);
+  terminal.print(asctime(timeinfo));
+}
+
 void wifiandBlynk() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, pass);
@@ -299,10 +335,12 @@ void wifiandBlynk() {
     delay(500);
     Serial.print(".");
   }
+  
   initTime("EST5EDT,M3.2.0,M11.1.0");
   setenv("TZ","EST5EDT,M3.2.0,M11.1.0",1);  //  Now adjust the TZ.  Clock settings are adjusted to show the new local time
   tzset();
   getLocalTime(&timeinfo);
+
 }
 
 // Your existing function, reused
@@ -335,7 +373,6 @@ void transmitReadings() {
   }
 
   readingCnt = 0;  // Clear for next batch
-  arrayCnt++;
   disableWiFi();   // Save power
 }
 
@@ -358,8 +395,38 @@ void sendLocalTimeToC3(const uint8_t *mac) {
   }
 }
 
+
+
+void saveReadingsToFlash() {
+  prefs.begin("relay", false, "nvs2");
+  arrayCnt++;
+  prefs.putBytes(String(arrayCnt).c_str(), &Readings, sizeof(Readings));
+  prefs.end();
+  Serial.println("Readings saved to flash");
+}
+
+void loadReadingsFromFlash() {
+  prefs.begin("relay", false, "nvs2");
+  memset(Readings, 0, sizeof(Readings));
+  while (arrayCnt > 0) {
+    prefs.getBytes(String(arrayCnt).c_str(), &Readings, sizeof(Readings));
+    readingCnt = maximumReadings; // Assume full buffer for simplicity
+    arrayCnt--;
+    transmitReadings();
+  }
+  prefs.end();
+}
+
+void clearFlash() {
+  prefs.begin("relay", false, "nvs2");
+  prefs.remove("readings");
+  prefs.remove("readingCnt");
+  prefs.end();
+  Serial.println("Flash cleared");
+}
 // Update the callback signature
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
+
   const uint8_t *mac = recv_info->src_addr;
   if (macEquals(mac, MAC_KAREN)) {
     currentSensorID = 24;
@@ -388,7 +455,7 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
     return;
   }
 
-  if (len == sizeof(sensorReadings)) {
+  /*if (len == sizeof(sensorReadings)) {
     if (readingCnt < maximumReadings) {
       memcpy(&Readings[readingCnt], incomingData, sizeof(sensorReadings));
       readingCnt++;
@@ -396,8 +463,26 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
     }
     lastReceiveTime = millis();  // Reset idle timer
     readyToSend = false;
+  }*/
+
+
+  if (len == sizeof(sensorReadings)) {
+    //readyToSend = true;
+    if (readingCnt < maximumReadings) {
+      memcpy(&Readings[readingCnt], incomingData, sizeof(sensorReadings));
+      readingCnt++;
+      Serial.printf("Received reading %d\n", readingCnt);
+    } else {
+      Serial.println("Buffer full. Saving to flash.");
+      saveReadingsToFlash();
+      //readingCnt = 0; // Reset reading count after saving
+      
+    }
+    lastReceiveTime = millis();
+    readyToSend = false;
   }
 }
+
 
 
 void setup() {
@@ -430,16 +515,27 @@ void loop() {
   if (readyToSend) {
     readyToSend = false;
     transmitReadings();
+    if (arrayCnt > 0) {
+      loadReadingsFromFlash(); // Load from flash if available
+    } 
   }
 
   every(300000) { // 5 minutes in ms
     wifiandBlynk();
+    Blynk.syncVirtual(V121); //flash button
     Blynk.run(); // Process Blynk events
+    Blynk.syncVirtual(V121); //flash button
     Blynk.run(); // Process Blynk events
     // Give Blynk a moment to update button state
     delay(500);
     if (buttonstart) {
-      // Stay connected, enable OTA
+      terminal.println("***RELAY STARTED***");
+      terminal.print("Connected to ");
+      terminal.println(ssid);
+      terminal.print("IP address: ");
+      terminal.println(WiFi.localIP());
+      printLocalTime();
+      terminal.flush();
       ArduinoOTA.setHostname("ESPNOWrelay");
       ArduinoOTA.begin();
       Serial.println("OTA enabled, waiting for updates...");
@@ -447,7 +543,7 @@ void loop() {
         Blynk.run();
         ArduinoOTA.handle();
         // If button is released, break and disconnect
-        // Blynk_WRITE(V120) will update buttonstart
+        // Blynk_WRITE(V121) will update buttonstart
       }
       disableWiFi();
       Serial.println("OTA session ended, WiFi disabled.");
