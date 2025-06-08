@@ -33,6 +33,19 @@ int WiFiStatus;
 WiFiClient client;
 
 
+// Reception state
+struct DeviceState {
+  bool receiving;
+  uint16_t expectedPackets;
+  uint16_t receivedPackets;
+  bool* packetReceived;
+  uint8_t* buffer;
+  uint32_t totalSize;
+  unsigned long lastActivity;
+  uint8_t sensorID;
+};
+
+DeviceState deviceStates[2]; // Support for 2 devices
 int batchFill = 0;
 uint8_t currentBatchNum = 0;
 IPAddress PGIP(192,168,50,197); 
@@ -165,19 +178,6 @@ uint8_t getSensorID(const uint8_t* mac) {
   return 0; // Unknown device
 }
 
-// Reception state
-struct DeviceState {
-  bool receiving;
-  uint16_t expectedPackets;
-  uint16_t receivedPackets;
-  bool* packetReceived;
-  uint8_t* buffer;
-  uint32_t totalSize;
-  unsigned long lastActivity;
-  uint8_t sensorID;
-};
-
-DeviceState deviceStates[2]; // Support for 2 devices
 
 DeviceState* getDeviceState(uint8_t sensorID) {
   if (sensorID == 1) return &deviceStates[0];
@@ -291,8 +291,13 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
       if (state->receiving && isTransmissionComplete(state)) {
         // Copy data to Readings array and save
         memcpy(&Readings, state->buffer, sizeof(Readings));
-        currentSensorID = sensorID;
-        saveReadingsToFlash(sensorID);
+        if (sensorID == 1) {
+          currentSensorID = 24; // Karen
+        } else if (sensorID == 2) {
+          currentSensorID = 42; // Leon
+        }
+        //currentSensorID = sensorID;
+        saveReadingsToFlash(currentSensorID);
         
         Serial.println("Data transmission completed successfully for sensor " + String(sensorID));
       } else {
@@ -652,6 +657,11 @@ void transmitReadings() {
                     "(42,3," + String(Readings[i].time) + "," + String(Readings[i].temp2, 3) + "), " +
                     "(42,4," + String(Readings[i].time) + "," + String(Readings[i].pres, 3) + ")";
       }
+      else {
+        Serial.println("Unknown sensor ID, skipping transmission.");
+        i++;
+        continue;
+      }
       conn.execute(tosendstr.c_str());
       pg_status = 3;
       delay(1);
@@ -669,13 +679,15 @@ void transmitReadings() {
 
 void loadFromFlash() {
   //prefs.begin("stuff", false, "nvs2");
-  currentSensorID = prefs.getInt("currentSensorID", 0);
+  
       while (arrayCnt > 0) {
-        
-        prefs.getBytes(String(arrayCnt).c_str(), &Readings, sizeof(Readings));
+        String key = String(arrayCnt) + "_" + String(currentSensorID);
+        Serial.print("Loading key ");
+        Serial.println(key);
+        prefs.getBytes(key.c_str(), &Readings, sizeof(Readings));
         readingCnt = maximumReadings;
         transmitReadings(); // Transmit the loaded readings
-        Serial.printf("Loaded and transmitted %d readings from flash\n", arrayCnt);
+        Serial.printf("Loaded and transmitted reading #%d from flash\n", arrayCnt);
 
         arrayCnt--;
         
@@ -695,11 +707,13 @@ void setup() {
   wifiandBlynk();
   prefs.begin("stuff", false, "nvs2");
   arrayCnt = prefs.getInt("arrayCnt", 0);
+  currentSensorID = prefs.getInt("currentSensorID", 0);
   
   if (arrayCnt == 0) {
     Serial.println("No previous readings found, initializing...");
   } else {
     Serial.printf("Found %d previous readings\n", arrayCnt);
+    Serial.printf("Current Sensor ID: %d\n", currentSensorID);
     loadFromFlash();
   }
   prefs.end();
@@ -722,49 +736,26 @@ void setup() {
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
   esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo)); // Zero-initialize
   
   // Add KAREN
   memcpy(peerInfo.peer_addr, MAC_KAREN, 6);
   peerInfo.channel = 0;
   peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA; // <-- Add this line
   esp_now_add_peer(&peerInfo);
   
   // Add LEON
   memcpy(peerInfo.peer_addr, MAC_LEON, 6);
   peerInfo.channel = 0;
   peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA; // <-- Add this line
   esp_now_add_peer(&peerInfo);
     Serial.println("ESP32 Receiver initialized and ready");
 }
 
 void loop() {
-    checkTimeouts();
-  if (isProcessingData && readingCnt > 0 && (millis() - lastReceiveTime > 5000)) {
-    Serial.println("timed out, marking ready to send partial data");
-    isProcessingData = false;
-    readyToSend = true;
-  }
-
-  if (readyToSend) {
-    //transmitReadings();
-    saveReadingsToFlash(currentSensorID);
-    readyToSend = false;
-    Serial.println("Data ready to send, saved to flash");
-    lastSaveTime = millis();  // Reset save timer
-    readyToReboot = true;
-      readingCnt = 0;  // Clear for next batch
-  }
-
-  if (readyToReboot && (millis() - lastSaveTime > 5000)) { // Wait 5 seconds after saving
-    Serial.println("Rebooting ESP...");
-    delay(1000);
-    ESP.restart();
-  }
-
-  //every(300000) { // 5 minutes in ms
-  //if (!isProcessingData && !readyToSend)
-  //  {ESP.restart();}
-
-  //}
-  delay(1);  // Keep loop efficient
+  checkTimeouts();
+  checkForRestart();
+  delay(100);
 }
