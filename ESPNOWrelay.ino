@@ -16,12 +16,22 @@ uint8_t MAC_LEON[]  = {0x84, 0xFC, 0xE6, 0x86, 0x5B, 0xB8}; // confirmed
 
 
 #define maximumReadings 360
-
+#define IDLE_RESTART_DELAY 10000 // 10 seconds, or whatever value you want
 int readingCnt = 0;
 #define IDLE_TIMEOUT 10000  // 10 seconds
 #define MAX_BUFFERED_FILES 500
 #define MAX_RAM_BUFFERS 10
 #define BATCH_SIZE 12
+volatile bool readyToSend = false;
+unsigned long lastReceiveTime = 0;
+unsigned long lastSaveTime = 0;
+bool needLoadFromFlash = false;
+int i = 0;
+RTC_DATA_ATTR int arrayCnt = 0;
+
+int WiFiStatus;
+WiFiClient client;
+
 
 int batchFill = 0;
 uint8_t currentBatchNum = 0;
@@ -33,12 +43,13 @@ const char* pass = "springchicken";
 const char user[] = "wanburst";       // your database user
 const char password[] = "elec&9";   // your database password
 const char dbname[] = "blynk_reporting";         // your database name
-
+unsigned long lastTransmissionTime = 0;
 volatile bool isProcessingData = false;
 volatile bool dataTransmissionComplete = false;
 bool buttonstart = false; // Button state to start transmission
 int currentSensorID = 0;  // 24 for Karen, 42 for Leon
 volatile bool havedata = false;
+volatile bool hasReceivedData = false;
 uint8_t pendingRequesterMAC[6];
 volatile bool hasPendingRequester = false;
 bool readyToReboot = false;
@@ -104,26 +115,244 @@ void initTime(String timezone){
 sensorReadings Readings[maximumReadings];
 sensorReadings batchBuffer[BATCH_SIZE];
 
-volatile bool readyToSend = false;
-unsigned long lastReceiveTime = 0;
-unsigned long lastSaveTime = 0;
-bool needLoadFromFlash = false;
-int i = 0;
-RTC_DATA_ATTR int arrayCnt = 0;
-
-int WiFiStatus;
-WiFiClient client;
+typedef struct {
+  uint8_t msgType;    // 0=data, 1=start, 2=end, 3=ack, 4=time_request, 5=time_response
+  uint16_t packetId;
+  uint16_t totalPackets;
+  uint16_t dataSize;
+  uint8_t data[240];
+} espnow_packet_t;
 
 
-void saveReadingsToFlash() {
+
+// Remove these duplicate lines:
+// Preferences prefs;
+// int arrayCnt = 0;
+// int readingCnt = maximumReadings;
+// int currentSensorID = 0;
+
+unsigned long localTimeUnix = 1672531200; // Default time (2023-01-01)
+
+// Timeout for incomplete transmissions
+const unsigned long TRANSMISSION_TIMEOUT = 30000; // 30 seconds
+
+void sendAck(const uint8_t* mac, uint16_t packetId) {
+  espnow_packet_t ack;
+  ack.msgType = 3; // ACK
+  ack.packetId = packetId;
+  ack.totalPackets = 0;
+  ack.dataSize = 0;
+  
+  esp_now_send(mac, (uint8_t*)&ack, sizeof(espnow_packet_t));
+}
+
+void sendTimeResponse(const uint8_t* mac) {
+  espnow_packet_t timeResponse;
+  timeResponse.msgType = 5; // Time response
+  timeResponse.packetId = 0;
+  timeResponse.totalPackets = 0;
+  timeResponse.dataSize = sizeof(unsigned long);
+  
+  memcpy(timeResponse.data, &localTimeUnix, sizeof(unsigned long));
+  
+  esp_now_send(mac, (uint8_t*)&timeResponse, sizeof(espnow_packet_t));
+  Serial.println("Sent time: " + String(localTimeUnix));
+}
+
+uint8_t getSensorID(const uint8_t* mac) {
+  if (memcmp(mac, MAC_KAREN, 6) == 0) return 1;
+  if (memcmp(mac, MAC_LEON, 6) == 0) return 2;
+  return 0; // Unknown device
+}
+
+// Reception state
+struct DeviceState {
+  bool receiving;
+  uint16_t expectedPackets;
+  uint16_t receivedPackets;
+  bool* packetReceived;
+  uint8_t* buffer;
+  uint32_t totalSize;
+  unsigned long lastActivity;
+  uint8_t sensorID;
+};
+
+DeviceState deviceStates[2]; // Support for 2 devices
+
+DeviceState* getDeviceState(uint8_t sensorID) {
+  if (sensorID == 1) return &deviceStates[0];
+  if (sensorID == 2) return &deviceStates[1];
+  return nullptr;
+}
+
+void initializeDeviceState(DeviceState* state, uint16_t totalPackets, uint32_t totalSize, uint8_t sensorID) {
+  if (state->packetReceived) free(state->packetReceived);
+  if (state->buffer) free(state->buffer);
+  
+  state->receiving = true;
+  state->expectedPackets = totalPackets;
+  state->receivedPackets = 0;
+  state->packetReceived = (bool*)calloc(totalPackets, sizeof(bool));
+  state->buffer = (uint8_t*)malloc(totalSize);
+  state->totalSize = totalSize;
+  state->lastActivity = millis();
+  state->sensorID = sensorID;
+  
+  Serial.println("Initialized reception for sensor " + String(sensorID) + 
+                ": " + String(totalPackets) + " packets, " + String(totalSize) + " bytes");
+}
+
+void cleanupDeviceState(DeviceState* state) {
+  if (state->packetReceived) {
+    free(state->packetReceived);
+    state->packetReceived = nullptr;
+  }
+  if (state->buffer) {
+    free(state->buffer);
+    state->buffer = nullptr;
+  }
+  state->receiving = false;
+}
+
+bool isTransmissionComplete(DeviceState* state) {
+  return state->receivedPackets == state->expectedPackets;
+}
+
+void saveReadingsToFlash(uint8_t sensorID) {
   prefs.begin("stuff", false, "nvs2");
   ++arrayCnt;
-  prefs.putBytes(String(arrayCnt).c_str(), &Readings, sizeof(Readings));
-  prefs.putInt("arrayCnt", arrayCnt); // <-- Save arrayCnt to NVS
+  
+  String key = String(arrayCnt) + "_" + String(sensorID);
+  prefs.putBytes(key.c_str(), &Readings, sizeof(Readings));
+  prefs.putInt("arrayCnt", arrayCnt);
   prefs.putInt("readingCnt", readingCnt);
-  prefs.putInt("currentSensorID", currentSensorID);
+  prefs.putInt("currentSensorID", sensorID);
+  
   prefs.end();
+  
+  Serial.println("Saved array " + String(arrayCnt) + " for sensor " + String(sensorID) + " to flash");
 }
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  const uint8_t *mac = info->src_addr;
+  espnow_packet_t packet;
+  memcpy(&packet, incomingData, sizeof(packet));
+  
+  uint8_t sensorID = getSensorID(mac);
+  if (sensorID == 0) {
+    Serial.println("Unknown device MAC");
+    return;
+  }
+  
+  DeviceState* state = getDeviceState(sensorID);
+  if (!state) return;
+  
+  state->lastActivity = millis();
+  
+  lastTransmissionTime = millis(); // Update global activity timer
+  
+  switch (packet.msgType) {
+    case 1: // Start packet
+      Serial.println("Start packet from sensor " + String(sensorID));
+      hasReceivedData = true;
+      initializeDeviceState(state, packet.totalPackets, packet.dataSize, sensorID);
+      sendAck(mac, packet.packetId);
+      break;
+      
+    case 0: // Data packet
+      if (state->receiving && packet.packetId > 0 && packet.packetId <= state->expectedPackets) {
+        uint16_t arrayIndex = packet.packetId - 1;
+        
+        if (!state->packetReceived[arrayIndex]) {
+          // Calculate offset in buffer
+          uint32_t offset = arrayIndex * 240;
+          uint32_t copySize = min((uint32_t)packet.dataSize, state->totalSize - offset);
+          
+          memcpy(state->buffer + offset, packet.data, copySize);
+          state->packetReceived[arrayIndex] = true;
+          state->receivedPackets++;
+          
+          Serial.println("Received data packet " + String(packet.packetId) + "/" + 
+                        String(state->expectedPackets) + " from sensor " + String(sensorID));
+        }
+        
+        sendAck(mac, packet.packetId);
+        
+        // Check if transmission is complete
+        if (isTransmissionComplete(state)) {
+          Serial.println("All data packets received from sensor " + String(sensorID));
+        }
+      }
+      break;
+      
+    case 2: // End packet
+      Serial.println("End packet from sensor " + String(sensorID));
+      
+      if (state->receiving && isTransmissionComplete(state)) {
+        // Copy data to Readings array and save
+        memcpy(&Readings, state->buffer, sizeof(Readings));
+        currentSensorID = sensorID;
+        saveReadingsToFlash(sensorID);
+        
+        Serial.println("Data transmission completed successfully for sensor " + String(sensorID));
+      } else {
+        Serial.println("Incomplete transmission from sensor " + String(sensorID) + 
+                      " (" + String(state->receivedPackets) + "/" + String(state->expectedPackets) + ")");
+      }
+      
+      cleanupDeviceState(state);
+      sendAck(mac, packet.packetId);
+      break;
+      
+    case 4: // Time request
+      Serial.println("Time request from sensor " + String(sensorID));
+    time_t now = mktime(&timeinfo); // local-adjusted time
+     localTimeUnix = static_cast<uint32_t>(now); // 32-bit to send via ESP-NOW
+      sendTimeResponse(mac);
+      break;
+  }
+}
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Handle send status if needed
+}
+
+void checkTimeouts() {
+  unsigned long currentTime = millis();
+  
+  for (int i = 0; i < 2; i++) {
+    DeviceState* state = &deviceStates[i];
+    if (state->receiving && (currentTime - state->lastActivity) > TRANSMISSION_TIMEOUT) {
+      Serial.println("Transmission timeout for sensor " + String(state->sensorID));
+      cleanupDeviceState(state);
+    }
+  }
+}
+
+bool allTransmissionsComplete() {
+  for (int i = 0; i < 2; i++) {
+    if (deviceStates[i].receiving) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void checkForRestart() {
+  if (!hasReceivedData) return;
+  
+  unsigned long currentTime = millis();
+  
+  if (allTransmissionsComplete() && 
+      (currentTime - lastTransmissionTime) > IDLE_RESTART_DELAY) {
+    
+    Serial.println("All transmissions complete. Restarting in 2 seconds...");
+    Serial.flush();
+    delay(2000);
+    ESP.restart();
+  }
+}
+
 
 
 /////////////////////////
@@ -329,35 +558,7 @@ void enableWiFi() {
 }
 
 
-/*void disableWiFi() {
-  Serial.println("Killing Wi-Fi...");
-  Blynk.disconnect();
-  delay(100);
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  delay(100);
-  
-  // Stop and deinit WiFi
-  esp_wifi_stop();
-  esp_wifi_deinit();
-  
-  // Delete the default event loop before recreating
-  esp_event_loop_delete_default();
-  
-  delay(100);
-  
-  // Reinit NVS and event loop
-  nvs_flash_deinit();
-  nvs_flash_init();
-  esp_event_loop_create_default();
-  esp_now_deinit();
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init failed");
-    return;
-  }
-  else {Serial.println("ESP-NOW init working!");}
-  delay(100);
-}*/
+
 
 
 void printLocalTime() {
@@ -464,127 +665,7 @@ void transmitReadings() {
 
 }
 
-bool macEquals(const uint8_t *mac1, const uint8_t *mac2) {
-  for (int i = 0; i < 6; i++) if (mac1[i] != mac2[i]) return false;
-  return true;
-}
 
-void sendLocalTimeToC3(const uint8_t *mac) {
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    time_t now = mktime(&timeinfo); // local-adjusted time
-    uint32_t localTimeUnix = static_cast<uint32_t>(now); // 32-bit to send via ESP-NOW
-
-    esp_now_send(mac, (uint8_t *)&localTimeUnix, sizeof(localTimeUnix));
-    Serial.print("Sent local time to C3: ");
-    Serial.println(localTimeUnix);
-  } else {
-    Serial.println("Failed to get local time");
-  }
-}
-
-// Add this global variable to store the last request sequence number per pending requester
-uint8_t pendingRequesterSeq = 0;
-
-// Modify onProcessingComplete to include the sequence number in the READY reply
-void onProcessingComplete() {
-  char completeMsg[9] = {'C','O','M','P','L','E','T','E', pendingRequesterSeq};
-  esp_now_send(pendingRequesterMAC, (const uint8_t *)completeMsg, sizeof(completeMsg));
-  if (hasPendingRequester) {
-    char readyMsg[6] = {'R','E','A','D','Y', pendingRequesterSeq};
-    esp_now_send(pendingRequesterMAC, (const uint8_t *)readyMsg, sizeof(readyMsg));
-    hasPendingRequester = false;
-  }
-}
-
-
-// Update the callback signature
-void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
-  Serial.println("Receiving something...");
-  const uint8_t *mac = recv_info->src_addr;
-  if (macEquals(mac, MAC_KAREN)) {
-    currentSensorID = 24;
-  } else if (macEquals(mac, MAC_LEON)) {
-    currentSensorID = 42;
-  } else {
-    currentSensorID = 0;  // Unknown sender
-  }
-  if (!esp_now_is_peer_exist(mac)) {
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, mac, 6);
-    peerInfo.channel = 0;
-    peerInfo.encrypt = false;
-    esp_now_add_peer(&peerInfo);
-    Serial.println("Added C3 as peer");
-  }
-  if (len == 1 && incomingData[0] == 0) { // Initial time request
-    Serial.println("Received time request, sending time...");
-    sendLocalTimeToC3(mac);
-    return;
-  }
-  if (len == 5 && strncmp((const char*)incomingData, "HELLO", 5) == 0) {
-    Serial.println("Received handshake");
-    const char *ackMsg = "ACK";
-    esp_now_send(mac, (const uint8_t *)ackMsg, strlen(ackMsg));
-    sendLocalTimeToC3(mac);
-    return;
-  }
-
-  // Handle REQUEST with sequence number
-  if (len == 8 && strncmp((const char*)incomingData, "REQUEST", 7) == 0) {
-    uint8_t seq = incomingData[7];
-    Serial.print("Received ready request, seq: ");
-    Serial.println(seq);
-
-    if (!isProcessingData && !readyToSend) {
-      Serial.println("Sending READY signal");
-      char readyMsg[6] = {'R','E','A','D','Y', seq};
-      esp_now_send(mac, (const uint8_t *)readyMsg, sizeof(readyMsg));
-      isProcessingData = true;
-      readingCnt = 0;
-      currentBatchNum = 0;
-      memcpy(pendingRequesterMAC, mac, 6);
-      pendingRequesterSeq = seq;
-    } else {
-      memcpy(pendingRequesterMAC, mac, 6);
-      pendingRequesterSeq = seq;
-      hasPendingRequester = true;
-    }
-    return;
-  }
-
-  // Handle batch data (multiple readings per packet)
-  if (isProcessingData && len > 0 && (len % sizeof(sensorReadings)) == 0) {
-    Serial.println("Receiving packet");
-    int numReadings = len / sizeof(sensorReadings);
-    for (int i = 0; i < numReadings; i++) {
-      if (readingCnt < maximumReadings) {
-        memcpy(&Readings[readingCnt], incomingData + i * sizeof(sensorReadings), sizeof(sensorReadings));
-        readingCnt++;
-        Serial.printf("Received #%d at %lu\n", readingCnt, millis());
-      }
-    }
-    // Send per-batch ACK
-    char ackMsg[5] = {'A','C','K','B', currentBatchNum};
-    Serial.printf("Sending ACK for batch %d\n", currentBatchNum);
-    esp_now_send(mac, (uint8_t*)ackMsg, sizeof(ackMsg));
-    currentBatchNum++;
-
-    lastReceiveTime = millis();
-
-    // If we've received a complete dataset
-    if (readingCnt >= maximumReadings) {
-      Serial.println("Complete dataset received, marking ready to send");
-      isProcessingData = false;
-      readyToSend = true;
-    }
-    return;
-  }
-
-  if (!isProcessingData && len > 0 && (len % sizeof(sensorReadings)) == 0) {
-    Serial.println("Received data but not in processing mode - ignoring");
-  }
-}
 
 void loadFromFlash() {
   //prefs.begin("stuff", false, "nvs2");
@@ -608,6 +689,7 @@ void loadFromFlash() {
 
 void setup() {
   sntp_set_time_sync_notification_cb(cbSyncTime);
+    memset(deviceStates, 0, sizeof(deviceStates));
   Serial.begin(115200);
   WiFi.mode(WIFI_STA);
   wifiandBlynk();
@@ -637,10 +719,26 @@ void setup() {
   else {Serial.println("ESP-NOW init working!");}
 
   // Register the new-style callback
+  esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
+  esp_now_peer_info_t peerInfo;
+  
+  // Add KAREN
+  memcpy(peerInfo.peer_addr, MAC_KAREN, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+  
+  // Add LEON
+  memcpy(peerInfo.peer_addr, MAC_LEON, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+    Serial.println("ESP32 Receiver initialized and ready");
 }
 
 void loop() {
+    checkTimeouts();
   if (isProcessingData && readingCnt > 0 && (millis() - lastReceiveTime > 5000)) {
     Serial.println("timed out, marking ready to send partial data");
     isProcessingData = false;
@@ -649,8 +747,7 @@ void loop() {
 
   if (readyToSend) {
     //transmitReadings();
-    saveReadingsToFlash();
-    onProcessingComplete();
+    saveReadingsToFlash(currentSensorID);
     readyToSend = false;
     Serial.println("Data ready to send, saved to flash");
     lastSaveTime = millis();  // Reset save timer
