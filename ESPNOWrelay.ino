@@ -311,7 +311,7 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
       
     case 4: // Time request
       Serial.println("Time request from sensor " + String(sensorID));
-    time_t now = mktime(&timeinfo); // local-adjusted time
+    time_t now = time(nullptr); // local-adjusted time
      localTimeUnix = static_cast<uint32_t>(now); // 32-bit to send via ESP-NOW
       sendTimeResponse(mac);
       break;
@@ -664,10 +664,10 @@ void transmitReadings() {
       }
       conn.execute(tosendstr.c_str());
       pg_status = 3;
-      delay(1);
+      delay(10);
       i++;
     }
-    delay(1);
+    delay(10);
   }
   Serial.printf("Transmission complete! Sent %d readings\n", readingCnt);
 
