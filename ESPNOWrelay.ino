@@ -22,6 +22,7 @@ int readingCnt = 0;
 #define MAX_BUFFERED_FILES 500
 #define MAX_RAM_BUFFERS 10
 #define BATCH_SIZE 12
+#define MAX_UPTIME 300000 // 5 minutes in milliseconds
 volatile bool readyToSend = false;
 unsigned long lastReceiveTime = 0;
 unsigned long lastSaveTime = 0;
@@ -344,9 +345,18 @@ bool allTransmissionsComplete() {
 }
 
 void checkForRestart() {
-  if (!hasReceivedData) return;
-  
   unsigned long currentTime = millis();
+  
+  // Check for 5-minute uptime restart (only if not busy)
+  if ((currentTime > MAX_UPTIME) && allTransmissionsComplete()) {
+    Serial.println("5-minute uptime reached. Restarting in 2 seconds...");
+    Serial.flush();
+    delay(2000);
+    ESP.restart();
+  }
+  
+  // Original restart logic after receiving data
+  if (!hasReceivedData) return;
   
   if (allTransmissionsComplete() && 
       (currentTime - lastTransmissionTime) > IDLE_RESTART_DELAY) {
